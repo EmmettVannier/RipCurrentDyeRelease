@@ -1,0 +1,311 @@
+---
+title: ""
+format:
+  html:
+    page-layout: full
+    self-contained: false
+---
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+#| results: asis
+
+library(sf)
+library(leaflet)
+library(htmlwidgets)
+library(htmltools)
+library(geojsonsf)
+library(jsonlite)
+
+# ── 1. Find shapefiles ──────────────────────────────────────────────────────
+shp_dir <- "Shapefiles"
+if (length(list.files(shp_dir, pattern = "\\.shp$")) == 0) {
+  shp_dir <- "C:/Users/ewvan/OneDrive - UBC/RipCurrentDyeStudy/rip-dye-release/Shapefiles"
+}
+shp_files <- list.files(shp_dir, pattern = "\\.shp$", full.names = TRUE)
+if (length(shp_files) == 0) {
+  stop("No shapefiles found. Working dir: ", getwd())
+}
+
+# ── 2. Load and merge shapefiles ────────────────────────────────────────────
+all_layers <- lapply(shp_files, function(f) {
+  base    <- tools::file_path_sans_ext(basename(f))
+  mins    <- as.integer(substr(base, 1, nchar(base) - 2))
+  secs    <- as.integer(substr(base, nchar(base) - 1, nchar(base)))
+  total_s <- mins * 60 + secs
+  label   <- sprintf("%02d:%02d", mins, secs)
+  layer           <- sf::st_read(f, quiet = TRUE)
+  layer$time_sec  <- total_s
+  layer$label     <- label
+  layer
+})
+all_layers  <- Filter(Negate(is.null), all_layers)
+plume_wgs84 <- do.call(rbind, all_layers)
+plume       <- sf::st_transform(plume_wgs84, 4326)
+
+# ── 3. Area and rate calculations ───────────────────────────────────────────
+plume_metric <- sf::st_transform(plume, 32610)
+time_steps   <- sort(unique(plume$time_sec))
+
+area_m2 <- sapply(time_steps, function(t) {
+  sub <- plume_metric[plume_metric$time_sec == t, ]
+  sum(as.numeric(sf::st_area(sub)))
+})
+rate_m2_per_sec <- c(NA, diff(area_m2) / diff(time_steps))
+
+adjusted_labels <- sapply(time_steps, function(s) {
+  adj <- max(0L, s - 88L)
+  sprintf("%02d:%02d", adj %/% 60L, adj %% 60L)
+})
+
+# ── 4. GeoJSON list ─────────────────────────────────────────────────────────
+geojson_list <- lapply(time_steps, function(t) {
+  subset_sf <- plume[plume$time_sec == t, ]
+  json_str  <- geojsonsf::sf_geojson(subset_sf)
+  jsonlite::fromJSON(json_str, simplifyVector = FALSE)
+})
+
+# ── 5. Leaflet map ──────────────────────────────────────────────────────────
+bbox    <- sf::st_bbox(plume)
+map_lng <- mean(c(bbox["xmin"], bbox["xmax"]))
+map_lat <- mean(c(bbox["ymin"], bbox["ymax"]))
+
+map <- leaflet(width = "100%", height = "520px")
+map <- addProviderTiles(map, providers$Esri.WorldImagery)
+map <- setView(map, lng = map_lng, lat = map_lat, zoom = 16)
+
+# ── 6. JS via raw string ────────────────────────────────────────────────────
+js_code <- r"(
+function(el, x, data) {
+
+  var lmap         = this;
+  var nSteps       = data.n_steps;
+  var playing      = false;
+  var timer        = null;
+  var currentLayer = null;
+
+  function fmtRate(r) {
+    if (r === null || r === undefined || isNaN(r)) return { text: '\u2014', cls: '' };
+    var val  = Math.abs(r).toFixed(2);
+    var cls  = r >= 0 ? 'positive' : 'negative';
+    var sign = r >= 0 ? '+' : '\u2212';
+    return { text: sign + val + ' m\u00b2/s', cls: cls };
+  }
+
+  var container = el.parentElement;
+  container.style.position = 'relative';
+
+  var ticksHtml = '<datalist id="stepTicks">';
+  for (var i = 0; i < nSteps; i++) {
+    ticksHtml += '<option value="' + i + '"></option>';
+  }
+  ticksHtml += '</datalist>';
+
+  var ui = document.createElement('div');
+  ui.style.cssText = [
+    'position:absolute',
+    'top:14px',
+    'left:50%',
+    'transform:translateX(-50%)',
+    'z-index:1000',
+    'background:rgba(10,22,40,0.92)',
+    'padding:11px 22px 15px 22px',
+    'border-radius:8px',
+    'box-shadow:0 3px 16px rgba(0,0,0,0.55)',
+    'font-family:IBM Plex Mono,monospace',
+    'font-size:12px',
+    'color:#e8dcc8',
+    'min-width:360px',
+    'text-align:center',
+    'border:1px solid rgba(74,158,187,0.35)',
+    'white-space:nowrap'
+  ].join(';');
+
+  ui.innerHTML =
+    '<div style="font-size:10px;text-transform:uppercase;letter-spacing:0.12em;color:#c4a882;margin-bottom:9px;">Time from Dye Release</div>' +
+    '<div style="display:flex;align-items:center;gap:12px;justify-content:center;">' +
+      '<button id="ppBtn" style="border:1px solid rgba(74,158,187,0.5);background:rgba(74,158,187,0.15);color:#e8dcc8;font-size:17px;cursor:pointer;border-radius:4px;width:32px;height:32px;flex-shrink:0;display:flex;align-items:center;justify-content:center;padding:0;">&#9654;</button>' +
+      ticksHtml +
+      '<input id="timeSlider" type="range" min="0" max="' + (nSteps - 1) + '" value="0" list="stepTicks" style="width:220px;accent-color:#c0392b;cursor:pointer;">' +
+      '<span id="timeLabel" style="min-width:48px;font-size:15px;font-weight:600;color:#ffffff;text-align:left;">00:00</span>' +
+    '</div>';
+
+  container.insertBefore(ui, el);
+
+  var stats = document.createElement('div');
+  stats.style.cssText = [
+    'background:#0a1628',
+    'color:#e8dcc8',
+    'font-family:IBM Plex Mono,monospace',
+    'font-size:13px',
+    'padding:12px 20px',
+    'display:flex',
+    'gap:40px',
+    'align-items:center',
+    'flex-wrap:wrap',
+    'border-top:2px solid #1a4a6e'
+  ].join(';');
+
+  stats.innerHTML =
+    '<div style="display:flex;flex-direction:column;gap:3px;">' +
+      '<span style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#c4a882;">Plume Area</span>' +
+      '<span style="font-size:16px;font-weight:500;color:#fff;" id="statArea">\u2014</span>' +
+    '</div>' +
+    '<div style="display:flex;flex-direction:column;gap:3px;">' +
+      '<span style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#c4a882;">Rate of Change</span>' +
+      '<span style="font-size:16px;font-weight:500;color:#fff;" id="statRate">\u2014</span>' +
+    '</div>' +
+    '<div style="display:flex;flex-direction:column;gap:3px;">' +
+      '<span style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#c4a882;">Timestep</span>' +
+      '<span style="font-size:16px;font-weight:500;color:#fff;" id="statStep">1 / ' + nSteps + '</span>' +
+    '</div>';
+
+  el.insertAdjacentElement('afterend', stats);
+
+  function showStep(i) {
+    if (currentLayer) { lmap.removeLayer(currentLayer); currentLayer = null; }
+
+    currentLayer = L.geoJSON(data.geojson_list[i], {
+      style: {
+        color       : '#8b1a1a',
+        weight      : 1.5,
+        opacity     : 0.9,
+        fillColor   : '#e02020',
+        fillOpacity : 0.40
+      }
+    }).addTo(lmap);
+
+    document.getElementById('timeLabel').textContent = data.adjusted_labels[i];
+    document.getElementById('timeSlider').value = i;
+
+    var aVal = data.area_m2[i];
+    document.getElementById('statArea').textContent =
+      (aVal !== null && aVal !== undefined)
+        ? aVal.toLocaleString('en-CA', { maximumFractionDigits: 1 }) + ' m\u00b2'
+        : '\u2014';
+
+    var ri  = fmtRate(data.rate_m2_per_sec[i]);
+    var rEl = document.getElementById('statRate');
+    rEl.textContent = ri.text;
+    rEl.style.color = ri.cls === 'positive' ? '#2ecc71' : ri.cls === 'negative' ? '#e74c3c' : '#fff';
+
+    document.getElementById('statStep').textContent = (i + 1) + ' / ' + nSteps;
+  }
+
+  document.getElementById('timeSlider').addEventListener('input', function() {
+    stopPlay();
+    showStep(parseInt(this.value));
+  });
+
+  var ppBtn = document.getElementById('ppBtn');
+
+  function startPlay() {
+    playing = true;
+    ppBtn.innerHTML = '&#9646;&#9646;';
+    var idx = parseInt(document.getElementById('timeSlider').value);
+    if (idx === nSteps - 1) idx = -1;
+    timer = setInterval(function() {
+      idx++;
+      showStep(idx);
+      if (idx === nSteps - 1) stopPlay();
+    }, 700);
+  }
+
+  function stopPlay() {
+    playing = false;
+    ppBtn.innerHTML = '&#9654;';
+    clearInterval(timer);
+  }
+
+  ppBtn.addEventListener('click', function() {
+    if (playing) { stopPlay(); } else { startPlay(); }
+  });
+
+  showStep(0);
+}
+)"
+
+map <- htmlwidgets::onRender(
+  map,
+  data = list(
+    geojson_list    = geojson_list,
+    adjusted_labels = as.list(adjusted_labels),
+    area_m2         = as.list(round(area_m2, 1)),
+    rate_m2_per_sec = as.list(rate_m2_per_sec),
+    n_steps         = length(time_steps)
+  ),
+  jsCode = js_code
+)
+
+# ── 7. Build full page with htmltools ────────────────────────────────────────
+page <- tagList(
+
+  tags$link(rel  = "stylesheet",
+            href = "https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=IBM+Plex+Mono:wght@400;500&family=Source+Sans+3:wght@300;400;600&display=swap"),
+
+  # Hero
+  tags$div(class = "site-hero",
+    tags$img(src = "sunset.jpg", alt = "Long Beach sunset"),
+    tags$div(class = "site-hero-overlay"),
+    tags$div(class = "site-hero-text",
+      tags$span(class = "hero-tag", "Field Research \u00b7 Long Beach, BC"),
+      tags$h1(HTML("<span style='color:#c4a882;'>Tracking a Rip Current Dye Release</span>")),
+      tags$p(HTML("Drone-derived shapefile analysis &nbsp;\u00b7&nbsp; Surf zone hydrodynamics &nbsp;\u00b7&nbsp; 2025"))
+    )
+  ),
+
+  # Dark intro band
+  tags$div(class = "section-dark",
+    tags$div(class = "section-dark-inner",
+      tags$h2("About the Study"),
+      tags$p("Fluorescent dye was released into an active rip current at Long Beach, British Columbia,
+        and tracked via drone imagery at regular intervals. Each shapefile represents the extent
+        of the dye plume at a discrete moment in time. Use the slider or press play to animate the sequence.")
+    )
+  ),
+
+  # Photo strip
+  tags$div(class = "photo-strip",
+    tags$div(class = "photo-strip-item",
+      tags$img(src = "lovekin_rock.jpg", alt = "Lovekin Rock"),
+      tags$div(class = "photo-strip-caption", "Lovekin Rock \u2014 Long Beach, BC")
+    ),
+    tags$div(class = "photo-strip-item",
+      tags$img(src = "shoreline.jpg", alt = "Long Beach shoreline"),
+      tags$div(class = "photo-strip-caption", "Shoreline \u2014 study site foreshore")
+    )
+  ),
+
+  # Map section
+  tags$div(id = "map", class = "map-section",
+    tags$div(class = "map-section-inner",
+      tags$h2("Interactive Plume Map"),
+      tags$p(class = "map-desc",
+        "Step through each timestep using the slider. The panel below shows plume area in m\u00b2 and rate of change from the previous frame."),
+      tags$div(class = "map-wrap", map)
+    )
+  )
+)
+
+# Intercept navbar links and scroll to map instead
+scroll_script <- tags$script(HTML('
+document.addEventListener("DOMContentLoaded", function() {
+  var links = document.querySelectorAll(".navbar-nav .nav-link, .navbar-brand");
+  links.forEach(function(link) {
+    link.addEventListener("click", function(e) {
+      var mapEl = document.getElementById("map");
+      if (mapEl) {
+        e.preventDefault();
+        mapEl.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    });
+  });
+});
+'))
+
+page <- tagAppendChild(page, scroll_script)
+
+browsable(page)
+```
